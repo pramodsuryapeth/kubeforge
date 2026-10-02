@@ -670,7 +670,7 @@ https://github.com/pramodsuryapeth/kubeforge
 
 The goal of KubeForge is to move Kubernetes infrastructure provisioning from a **static command-execution process** toward an **intelligent, evidence-driven, self-recovering automation workflow**.
 
-
+```text
 Detect
   ↓
 Understand
@@ -682,4 +682,5 @@ Remediate
 Verify
   ↓
 Continue
+```
 
