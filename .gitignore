@@ -1,0 +1,14 @@
+# Node
+node_modules/
+dist/
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+ai-service/app/outcomes.json
+
+# OS
+.DS_Store

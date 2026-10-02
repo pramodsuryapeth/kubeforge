@@ -1,0 +1,2172 @@
+/**
+ * Runs the actual cluster install, following the exact command sequence
+ * from the project's reference setup guide (RKE2+Canal/Calico/Cilium,
+ * kubeadm+Calico/Cilium/Flannel/Weave, Kubespray+Calico/Cilium/Flannel).
+ *
+ * IMPORTANT:
+ * - Existing provisioning behavior is preserved.
+ * - Every provisioning command gets a global step number.
+ * - Execution state is persisted on the Project document.
+ * - A retry can resume from the failed step instead of executing
+ *   previously completed steps again.
+ * - Existing onLog() events are preserved and only enriched with
+ *   execution metadata.
+ */
+
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const fs = require('fs');
+const path = require('path');
+const sshClient = require('./sshClient');
+const { getCredential } = require('./cryptoVault');
+
+const execFileAsync = promisify(execFile);
+
+class ProvisionError extends Error {
+  constructor(vm, command, result, executionState = null) {
+    super(`Command failed on ${vm.name}: ${command}`);
+    this.name = 'ProvisionError';
+    this.vm = vm;
+    this.command = command;
+    this.result = result;
+    this.executionState = executionState;
+  }
+}
+
+const COMMON_PREP = [
+  {
+    command: 'swapoff -a',
+    rollback: 'swapon -a',
+    description: 'Disable swap',
+  },
+
+  {
+    command: "sed -i '/ swap / s/^/#/' /etc/fstab",
+    rollback: null,
+    description: 'Persist swap-disabled across reboots',
+  },
+
+  {
+    command: 'modprobe overlay',
+    rollback: null,
+    description: 'Load overlay kernel module',
+  },
+
+  {
+    command: 'modprobe br_netfilter',
+    rollback: null,
+    description: 'Load br_netfilter kernel module',
+  },
+
+  {
+    command:
+      "if [ \"$(sysctl -n net.ipv4.ip_forward 2>/dev/null)\" = \"1\" ]; then " +
+      "echo '[SKIP] net.ipv4.ip_forward already set to 1'; " +
+      "else " +
+      "sysctl -w net.ipv4.ip_forward=1; " +
+      "fi",
+    rollback: null,
+    description: 'Ensure IPv4 forwarding is enabled',
+  },
+
+  {
+    command:
+      "if [ \"$(sysctl -n net.bridge.bridge-nf-call-iptables 2>/dev/null)\" = \"1\" ]; then " +
+      "echo '[SKIP] net.bridge.bridge-nf-call-iptables already set to 1'; " +
+      "else " +
+      "sysctl -w net.bridge.bridge-nf-call-iptables=1; " +
+      "fi",
+    rollback: null,
+    description: 'Ensure bridged-traffic iptables visibility',
+  },
+];
+
+/**
+ * Derives the conventional cluster-dns IP:
+ * the 10th address in the Service CIDR range.
+ *
+ * Example:
+ * 10.96.0.0/12 -> 10.96.0.10
+ */
+function deriveClusterDNS(serviceCidr) {
+  const base = serviceCidr.split('/')[0];
+  const octets = base.split('.').map(Number);
+
+  let n =
+    ((octets[0] << 24) |
+      (octets[1] << 16) |
+      (octets[2] << 8) |
+      octets[3]) >>>
+    0;
+
+  n = (n + 10) >>> 0;
+
+  return [24, 16, 8, 0]
+    .map((shift) => (n >>> shift) & 255)
+    .join('.');
+}
+
+/**
+ * Maps project's CNI onto RKE2's built-in values.
+ */
+function mapCniForRke2(cni) {
+  if (cni === 'Calico') return 'calico';
+  if (cni === 'Cilium') return 'cilium';
+
+  // Flannel, Weave, or anything else:
+  // RKE2's closest built-in equivalent is Canal.
+  return 'canal';
+}
+
+/**
+ * Actual SSH login user's home directory.
+ */
+function homeDirFor(vm) {
+  return vm.username === 'root'
+    ? '/root'
+    : `/home/${vm.username}`;
+}
+
+/**
+ * Writes kubeconfig to the actual SSH user's home.
+ */
+async function writeKubeconfigForUser(vm, sourcePath, runOn) {
+  const home = homeDirFor(vm);
+
+  if (home === '/root') {
+    return;
+  }
+
+  await runOn(
+    vm,
+    `mkdir -p ${home}/.kube && cp ${sourcePath} ${home}/.kube/config && chown -R ${vm.username}:${vm.username} ${home}/.kube`,
+    {
+      description: `Make kubectl work for ${vm.username} from their own home directory`,
+      phase: 'kubeconfig',
+    },
+  );
+}
+
+/**
+ * Number of CNI commands for kubeadm.
+ *
+ * This is used only for displaying the total provisioning count.
+ */
+function getKubeadmCniStepCount(cni) {
+  if (cni === 'Calico') return 5;
+  if (cni === 'Cilium') return 3;
+  if (cni === 'Flannel') return 3;
+
+  // Weave
+  return 1;
+}
+
+/**
+ * Calculates total provisioning steps.
+ *
+ * The count includes:
+ * - COMMON_PREP
+ * - method-specific provisioning
+ * - CNI
+ * - joins
+ *
+ * Kubespray is intentionally represented as two high-level steps:
+ * inventory generation and ansible-playbook execution.
+ */
+function getProvisionTotalSteps(project, vms) {
+  const commonSteps =
+    project.provisioningMethod === 'Kubespray'
+      ? 0
+      : COMMON_PREP.length * vms.length;
+
+  if (project.provisioningMethod === 'RKE2') {
+    const controlPlanes = vms.filter(
+      (v) => v.role === 'Control Plane',
+    );
+
+    const workers = vms.filter(
+      (v) => v.role === 'Worker',
+    );
+
+    const [, ...restCP] = controlPlanes;
+
+    // Primary CP:
+    // configure + install + start + kubectl + kubeconfig +
+    // user kubeconfig + token
+    const primarySteps = 7;
+
+    // Additional CP:
+    // configure + install + start
+    const additionalControlPlaneSteps = restCP.length * 3;
+
+    // Worker:
+    // configure + install + start
+    const workerSteps = workers.length * 3;
+
+    return (
+      commonSteps +
+      primarySteps +
+      additionalControlPlaneSteps +
+      workerSteps
+    );
+  }
+
+  if (project.provisioningMethod === 'kubeadm') {
+    const controlPlanes = vms.filter(
+      (v) => v.role === 'Control Plane',
+    );
+
+    const workers = vms.filter(
+      (v) => v.role === 'Worker',
+    );
+
+    const [, ...restCP] = controlPlanes;
+
+    /*
+     * Every VM:
+     * 1. Configure Kubernetes repository
+     * 2. Install containerd/kubeadm/kubelet/kubectl
+     * 3. Enable containerd
+     */
+    const packageSteps = vms.length * 3;
+
+    /*
+     * Primary CP:
+     * 1. kubeadm init
+     * 2. root kubeconfig
+     * 3. user kubeconfig
+     * 4. generate join command
+     */
+    const primaryControlPlaneSteps = 4;
+
+    const cniSteps = getKubeadmCniStepCount(project.cni);
+
+    /*
+     * Additional CP + workers:
+     * kubeadm join
+     */
+    const joinSteps = restCP.length + workers.length;
+
+    return (
+      commonSteps +
+      packageSteps +
+      primaryControlPlaneSteps +
+      cniSteps +
+      joinSteps
+    );
+  }
+
+  if (project.provisioningMethod === 'Kubespray') {
+    // Generate inventory + run ansible-playbook
+    return 2;
+  }
+
+  return commonSteps;
+}
+
+/**
+ * Persist provisioning execution state.
+ *
+ * We intentionally use the existing Project mongoose document.
+ * No new repository layer is required.
+ */
+async function persistExecutionState(project, state) {
+  if (!project) {
+    return;
+  }
+
+  project.executionState = {
+    ...(project.executionState || {}),
+    ...state,
+    updatedAt: new Date(),
+  };
+
+  /*
+   * Project is normally a mongoose document.
+   *
+   * If save() is unavailable, keep the state in memory so the
+   * existing provisioning flow does not break.
+   */
+  if (typeof project.save === 'function') {
+    await project.save();
+  }
+}
+
+/**
+ * Build the command runner.
+ *
+ * Existing runOn() behavior is preserved.
+ *
+ * New:
+ * - phase
+ * - stepIndex
+ * - totalSteps
+ * - currentStep
+ * - resume support
+ * - persistent executionState
+ */
+function runOnFactory(
+  onLog,
+  {
+    project = null,
+    resumeFromStep = 0,
+    totalSteps = 0,
+  } = {},
+) {
+  return async (
+    vm,
+    command,
+    {
+      sudo = true,
+      description,
+      phase = 'provisioning',
+      stepIndex = null,
+      totalSteps: commandTotalSteps = null,
+    } = {},
+  ) => {
+    const credential = await getCredential(vm.credentialRef);
+
+    if (!credential) {
+      throw new ProvisionError(vm, command, {
+        stdout: '',
+        stderr: `No credential for "${vm.credentialRef}"`,
+        code: 1,
+      });
+    }
+
+    const commandName = description || command;
+
+    const resolvedStep =
+      typeof stepIndex === 'number'
+        ? stepIndex
+        : null;
+
+    const resolvedTotal =
+      typeof commandTotalSteps === 'number'
+        ? commandTotalSteps
+        : totalSteps;
+
+    /*
+     * --------------------------------------------------
+     * RESUME CHECK
+     * --------------------------------------------------
+     *
+     * If a previous provisioning attempt completed this step,
+     * do not execute it again.
+     *
+     * Example:
+     *
+     * lastCompletedStep = 8
+     *
+     * step 1..8 -> skipped
+     * step 9     -> executed
+     */
+    if (
+      resolvedStep !== null &&
+      resolvedStep <= resumeFromStep
+    ) {
+      onLog({
+        time: new Date().toISOString(),
+        host: vm.name,
+        command: commandName,
+        output: `[SKIP] Already completed during previous attempt (${resolvedStep}/${resolvedTotal})`,
+        status: 'skipped',
+        stage: 'provisioning',
+        phase,
+        stepIndex: resolvedStep,
+        totalSteps: resolvedTotal,
+      });
+
+      return {
+        stdout: '',
+        stderr: '',
+        code: 0,
+        skipped: true,
+      };
+    }
+
+    /*
+     * --------------------------------------------------
+     * PERSIST CURRENT STEP
+     * --------------------------------------------------
+     */
+    if (project && resolvedStep !== null) {
+      await persistExecutionState(project, {
+        status: 'running',
+        vm: vm.name,
+        phase,
+        stepIndex: resolvedStep,
+        totalSteps: resolvedTotal,
+        currentStep: commandName,
+        currentCommand: command,
+        lastCompletedStep: resumeFromStep,
+        error: {
+          code: null,
+          message: null,
+        },
+        startedAt:
+          project.executionState?.startedAt ||
+          new Date(),
+      });
+    }
+
+    /*
+     * --------------------------------------------------
+     * COMMAND STARTED
+     * --------------------------------------------------
+     */
+    onLog({
+      time: new Date().toISOString(),
+      host: vm.name,
+      command: commandName,
+      output:
+        resolvedStep !== null
+          ? `[RUNNING] Step ${resolvedStep}/${resolvedTotal} is currently executing...`
+          : '[RUNNING] Command is currently executing...',
+      status: 'running',
+      stage: 'provisioning',
+      phase,
+      stepIndex: resolvedStep,
+      totalSteps: resolvedTotal,
+    });
+
+    let result;
+
+    try {
+      result = await sshClient.withConnection(
+        vm,
+        credential,
+        (conn) =>
+          sshClient.exec(conn, command, {
+            sudo,
+            password:
+              credential.authType === 'password'
+                ? credential.secret
+                : null,
+          }),
+      );
+    } catch (err) {
+      result = {
+        stdout: '',
+        stderr: err.message,
+        code: 1,
+      };
+    }
+
+    /*
+     * --------------------------------------------------
+     * COMMAND COMPLETED / FAILED
+     * --------------------------------------------------
+     */
+    onLog({
+      time: new Date().toISOString(),
+      host: vm.name,
+      command: commandName,
+      output:
+        result.code === 0
+          ? result.stdout || '[OK]'
+          : `[ERROR] ${
+              result.stderr ||
+              result.stdout ||
+              'command failed'
+            }`,
+      status:
+        result.code === 0
+          ? 'completed'
+          : 'failed',
+      stage: 'provisioning',
+      phase,
+      stepIndex: resolvedStep,
+      totalSteps: resolvedTotal,
+    });
+
+    /*
+     * --------------------------------------------------
+     * FAILURE
+     * --------------------------------------------------
+     */
+    if (result.code !== 0) {
+      if (project && resolvedStep !== null) {
+        await persistExecutionState(project, {
+          status: 'failed',
+          vm: vm.name,
+          phase,
+          stepIndex: resolvedStep,
+          totalSteps: resolvedTotal,
+          currentStep: commandName,
+          currentCommand: command,
+          lastCompletedStep:
+            Math.max(
+              0,
+              resolvedStep - 1,
+            ),
+          error: {
+            code: String(result.code),
+            message:
+              result.stderr ||
+              result.stdout ||
+              'command failed',
+          },
+        });
+      }
+
+      throw new ProvisionError(
+        vm,
+        command,
+        result,
+        project?.executionState || null,
+      );
+    }
+
+    /*
+     * --------------------------------------------------
+     * SUCCESS
+     * --------------------------------------------------
+     */
+    if (project && resolvedStep !== null) {
+      await persistExecutionState(project, {
+        status: 'running',
+        vm: vm.name,
+        phase,
+        stepIndex: resolvedStep,
+        totalSteps: resolvedTotal,
+        currentStep: commandName,
+        currentCommand: command,
+
+        /*
+         * This is the key checkpoint.
+         *
+         * Once a command succeeds:
+         *
+         * lastCompletedStep = current step
+         */
+        lastCompletedStep: resolvedStep,
+
+        error: {
+          code: null,
+          message: null,
+        },
+      });
+    }
+
+    return result;
+  };
+}
+
+/**
+ * --------------------------------------------------
+ * RKE2
+ * --------------------------------------------------
+ */
+async function provisionRKE2(
+  project,
+  vms,
+  runOn,
+  stepContext,
+) {
+  const [primaryCP, ...restCP] =
+    vms.filter(
+      (v) => v.role === 'Control Plane',
+    );
+
+  const workers =
+    vms.filter(
+      (v) => v.role === 'Worker',
+    );
+
+  const rke2Cni =
+    mapCniForRke2(project.cni);
+
+  const clusterDns =
+    deriveClusterDNS(project.serviceCidr);
+
+  const serverConfig =
+    `cni: ${rke2Cni}\n` +
+    `cluster-cidr: ${project.podCidr}\n` +
+    `service-cidr: ${project.serviceCidr}\n` +
+    `cluster-dns: ${clusterDns}\n`;
+
+  const writeServerConfig =
+    `mkdir -p /etc/rancher/rke2 && ` +
+    `printf "${serverConfig.replace(
+      /\n/g,
+      '\\n',
+    )}" > /etc/rancher/rke2/config.yaml`;
+
+  const nextStep = () => stepContext.next();
+
+  await runOn(
+    primaryCP,
+    writeServerConfig,
+    {
+      description: `Configure RKE2 (cni: ${rke2Cni})`,
+      phase: 'rke2',
+      ...nextStep(),
+    },
+  );
+
+  await runOn(
+    primaryCP,
+    'curl -sfL https://get.rke2.io | sh -',
+    {
+      description: 'Install RKE2 server',
+      phase: 'rke2',
+      ...nextStep(),
+    },
+  );
+
+  await runOn(
+    primaryCP,
+    'systemctl enable --now rke2-server',
+    {
+      description: 'Start RKE2 server',
+      phase: 'rke2',
+      ...nextStep(),
+    },
+  );
+
+  await runOn(
+    primaryCP,
+    'ln -sf /var/lib/rancher/rke2/bin/kubectl /usr/local/bin/kubectl',
+    {
+      description: 'Link kubectl',
+      phase: 'rke2',
+      ...nextStep(),
+    },
+  );
+
+  await runOn(
+    primaryCP,
+    'mkdir -p /root/.kube && cp /etc/rancher/rke2/rke2.yaml /root/.kube/config',
+    {
+      description: 'Write kubeconfig',
+      phase: 'rke2',
+      ...nextStep(),
+    },
+  );
+
+  await writeKubeconfigForUser(
+    primaryCP,
+    '/etc/rancher/rke2/rke2.yaml',
+    runOn,
+  );
+
+  /*
+   * writeKubeconfigForUser() itself uses runOn(),
+   * so it needs a step.
+   *
+   * The helper above already executed before we can continue,
+   * therefore this step is accounted here.
+   */
+  stepContext.consumeExternalStep();
+
+  const tokenResult =
+    await runOn(
+      primaryCP,
+      'cat /var/lib/rancher/rke2/server/node-token',
+      {
+        description:
+          'Retrieve cluster join token',
+        phase: 'rke2',
+        ...nextStep(),
+      },
+    );
+
+  const token =
+    tokenResult.stdout.trim();
+
+  for (const vm of restCP) {
+    const cfg =
+      `server: https://${primaryCP.ip}:9345\n` +
+      `token: ${token}\n`;
+
+    await runOn(
+      vm,
+      `mkdir -p /etc/rancher/rke2 && printf "${cfg.replace(
+        /\n/g,
+        '\\n',
+      )}" > /etc/rancher/rke2/config.yaml`,
+      {
+        description:
+          'Configure as additional control plane',
+        phase: 'rke2',
+        ...nextStep(),
+      },
+    );
+
+    await runOn(
+      vm,
+      'curl -sfL https://get.rke2.io | sh -',
+      {
+        description:
+          'Install RKE2 server',
+        phase: 'rke2',
+        ...nextStep(),
+      },
+    );
+
+    await runOn(
+      vm,
+      'systemctl enable --now rke2-server',
+      {
+        description:
+          'Start RKE2 server',
+        phase: 'rke2',
+        ...nextStep(),
+      },
+    );
+  }
+
+  for (const vm of workers) {
+    const cfg =
+      `server: https://${primaryCP.ip}:9345\n` +
+      `token: ${token}\n`;
+
+    await runOn(
+      vm,
+      `mkdir -p /etc/rancher/rke2 && printf "${cfg.replace(
+        /\n/g,
+        '\\n',
+      )}" > /etc/rancher/rke2/config.yaml`,
+      {
+        description:
+          'Configure RKE2 agent',
+        phase: 'rke2',
+        ...nextStep(),
+      },
+    );
+
+    await runOn(
+      vm,
+      'curl -sfL https://get.rke2.io | INSTALL_RKE2_TYPE="agent" sh -',
+      {
+        description:
+          'Install RKE2 agent',
+        phase: 'rke2',
+        ...nextStep(),
+      },
+    );
+
+    await runOn(
+      vm,
+      'systemctl enable --now rke2-agent',
+      {
+        description:
+          'Start RKE2 agent',
+        phase: 'rke2',
+        ...nextStep(),
+      },
+    );
+  }
+}
+
+/**
+ * --------------------------------------------------
+ * kubeadm CNI
+ * --------------------------------------------------
+ */
+async function installKubeadmCNI(
+  project,
+  primaryCP,
+  runOn,
+  stepContext,
+) {
+  const { cni, podCidr } = project;
+
+  const nextStep = () =>
+    stepContext.next();
+
+  if (cni === 'Calico') {
+    await runOn(
+      primaryCP,
+      'kubectl apply --server-side -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.0/manifests/operator-crds.yaml',
+      {
+        description: 'Install/validate Calico operator CRDs',
+        phase: 'kubeadm-cni',
+        ...nextStep(),
+      },
+    );
+
+    await runOn(
+      primaryCP,
+      'kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.0/manifests/tigera-operator.yaml',
+      {
+        description: 'Install/validate Calico Tigera operator',
+        phase: 'kubeadm-cni',
+        ...nextStep(),
+      },
+    );
+
+    await runOn(
+      primaryCP,
+      'curl -fsSLO https://raw.githubusercontent.com/projectcalico/calico/v3.31.0/manifests/custom-resources.yaml',
+      {
+        description: 'Download Calico custom-resources.yaml',
+        phase: 'kubeadm-cni',
+        ...nextStep(),
+      },
+    );
+
+    await runOn(
+      primaryCP,
+      `sed -i "s#192.168.0.0/16#${podCidr}#" custom-resources.yaml`,
+      {
+        description: 'Set Calico pod CIDR',
+        phase: 'kubeadm-cni',
+        ...nextStep(),
+      },
+    );
+
+    await runOn(
+      primaryCP,
+      'kubectl apply -f custom-resources.yaml',
+      {
+        description: 'Apply/validate Calico custom resources',
+        phase: 'kubeadm-cni',
+        ...nextStep(),
+      },
+    );
+  } else if (cni === 'Cilium') {
+    await runOn(
+      primaryCP,
+      'curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/latest/download/cilium-linux-amd64.tar.gz',
+      {
+        description: 'Download Cilium CLI',
+        phase: 'kubeadm-cni',
+        ...nextStep(),
+      },
+    );
+
+    await runOn(
+      primaryCP,
+      'tar xzvf cilium-linux-amd64.tar.gz -C /usr/local/bin',
+      {
+        description: 'Install Cilium CLI',
+        phase: 'kubeadm-cni',
+        ...nextStep(),
+      },
+    );
+
+    await runOn(
+      primaryCP,
+      `cilium install --set ipam.mode=cluster-pool --set ipam.operator.clusterPoolIPv4PodCIDRList="${podCidr}"`,
+      {
+        description: 'Install Cilium CNI',
+        phase: 'kubeadm-cni',
+        ...nextStep(),
+      },
+    );
+  } else if (cni === 'Flannel') {
+    await runOn(
+      primaryCP,
+      'curl -fsSLO https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml',
+      {
+        description: 'Download Flannel manifest',
+        phase: 'kubeadm-cni',
+        ...nextStep(),
+      },
+    );
+
+    await runOn(
+      primaryCP,
+      `sed -i "s#\\"Network\\": \\"10.244.0.0/16\\"#\\"Network\\": \\"${podCidr}\\"#" kube-flannel.yml`,
+      {
+        description: 'Set Flannel pod CIDR',
+        phase: 'kubeadm-cni',
+        ...nextStep(),
+      },
+    );
+
+    await runOn(
+      primaryCP,
+      'kubectl apply -f kube-flannel.yml',
+      {
+        description: 'Apply Flannel CNI',
+        phase: 'kubeadm-cni',
+        ...nextStep(),
+      },
+    );
+  } else {
+    await runOn(
+      primaryCP,
+      `kubectl apply -f "https://reweave.azurewebsites.net/k8s/v1.30/net.yaml?env.IPALLOC_RANGE=${podCidr}"`,
+      {
+        description: 'Apply Weave CNI (legacy community fork)',
+        phase: 'kubeadm-cni',
+        ...nextStep(),
+      },
+    );
+  }
+}
+
+/**
+ * --------------------------------------------------
+ * kubeadm
+ * --------------------------------------------------
+ */
+async function validateClusterHealth(
+  project,
+  vms = project.vms,
+) {
+  const controlPlane = vms.find(
+    (v) => v.role === 'Control Plane',
+  );
+
+  if (!controlPlane) {
+    throw new Error(
+      'No Control Plane node to validate against',
+    );
+  }
+
+  const credential =
+    await getCredential(
+      controlPlane.credentialRef,
+    );
+
+  if (!credential) {
+    throw new Error(
+      `No credential registered for "${controlPlane.credentialRef}"`,
+    );
+  }
+
+  return sshClient.withConnection(
+    controlPlane,
+    credential,
+    async (conn) => {
+      const kubectl = (args) =>
+        sshClient.exec(
+          conn,
+          `${KUBECONFIG_PREAMBLE}\nkubectl ${args} 2>&1`,
+          {
+            sudo: true,
+            password:
+              credential.authType === 'password'
+                ? credential.secret
+                : null,
+          },
+        );
+
+      const expectedNodes =
+        vms.filter(
+          (vm) =>
+            vm.role === 'Control Plane' ||
+            vm.role === 'Worker',
+        );
+
+      const totalNodes =
+        expectedNodes.length;
+
+      const maxAttempts = 12;
+      const intervalMs = 10_000;
+
+      let nodes = {
+        code: 1,
+        stdout: '',
+        stderr: '',
+      };
+
+      let pods = {
+        code: 1,
+        stdout: '',
+        stderr: '',
+      };
+
+      let coredns = {
+        code: 1,
+        stdout: '',
+        stderr: '',
+      };
+
+      let calico = {
+        code: 1,
+        stdout: '',
+        stderr: '',
+      };
+
+      let svc = {
+        code: 1,
+        stdout: '',
+        stderr: '',
+      };
+
+      for (
+        let attempt = 1;
+        attempt <= maxAttempts;
+        attempt++
+      ) {
+        /*
+         * ------------------------------------------
+         * Nodes
+         * ------------------------------------------
+         */
+
+        nodes =
+          await kubectl(
+            'get nodes --no-headers',
+          );
+
+        const readyNodes =
+          (
+            nodes.stdout.match(
+              /\bReady\b/g,
+            ) || []
+          ).length;
+
+        /*
+         * ------------------------------------------
+         * All pods
+         * ------------------------------------------
+         */
+
+        pods =
+          await kubectl(
+            'get pods -A --no-headers',
+          );
+
+        const podLines =
+          pods.stdout
+            .split('\n')
+            .map((line) =>
+              line.trim(),
+            )
+            .filter(Boolean);
+
+        const unhealthyPods =
+          podLines.filter(
+            (line) =>
+              !/\b(Running|Completed)\b/.test(
+                line,
+              ),
+          );
+
+        /*
+         * ------------------------------------------
+         * CoreDNS
+         * ------------------------------------------
+         */
+
+        coredns =
+          await kubectl(
+            '-n kube-system get pods -l k8s-app=kube-dns --no-headers',
+          );
+
+        const corednsLines =
+          coredns.stdout
+            .split('\n')
+            .map((line) =>
+              line.trim(),
+            )
+            .filter(Boolean);
+
+        const dnsHealthy =
+          coredns.code === 0 &&
+          corednsLines.length > 0 &&
+          corednsLines.every(
+            (line) =>
+              /\bRunning\b/.test(line) &&
+              !/\b0\/\d+\b/.test(line),
+          );
+
+        /*
+         * ------------------------------------------
+         * Calico
+         * ------------------------------------------
+         */
+
+        calico =
+          await kubectl(
+            '-n calico-system get pods --no-headers',
+          );
+
+        const calicoLines =
+          calico.stdout
+            .split('\n')
+            .map((line) =>
+              line.trim(),
+            )
+            .filter(Boolean);
+
+        const calicoHealthy =
+          calico.code === 0 &&
+          calicoLines.length > 0 &&
+          calicoLines.every(
+            (line) =>
+              /\bRunning\b/.test(line) &&
+              !/\b0\/\d+\b/.test(line),
+          );
+
+        /*
+         * ------------------------------------------
+         * Services
+         * ------------------------------------------
+         */
+
+        svc =
+          await kubectl(
+            'get svc -A --no-headers',
+          );
+
+        /*
+         * ------------------------------------------
+         * Overall health
+         * ------------------------------------------
+         */
+
+        const clusterHealthy =
+          nodes.code === 0 &&
+          readyNodes === totalNodes &&
+          dnsHealthy &&
+          calicoHealthy &&
+          unhealthyPods.length === 0 &&
+          svc.code === 0;
+
+        if (clusterHealthy) {
+          break;
+        }
+
+        if (
+          attempt < maxAttempts
+        ) {
+          await sleep(
+            intervalMs,
+          );
+        }
+      }
+
+      /*
+       * ------------------------------------------
+       * Final calculations
+       * ------------------------------------------
+       */
+
+      const readyNodes =
+        (
+          nodes.stdout.match(
+            /\bReady\b/g,
+          ) || []
+        ).length;
+
+      const podLines =
+        pods.stdout
+          .split('\n')
+          .map((line) =>
+            line.trim(),
+          )
+          .filter(Boolean);
+
+      const unhealthyPods =
+        podLines.filter(
+          (line) =>
+            !/\b(Running|Completed)\b/.test(
+              line,
+            ),
+        );
+
+      const corednsLines =
+        coredns.stdout
+          .split('\n')
+          .map((line) =>
+            line.trim(),
+          )
+          .filter(Boolean);
+
+      const dnsHealthy =
+        coredns.code === 0 &&
+        corednsLines.length > 0 &&
+        corednsLines.every(
+          (line) =>
+            /\bRunning\b/.test(line) &&
+            !/\b0\/\d+\b/.test(line),
+        );
+
+      const calicoLines =
+        calico.stdout
+          .split('\n')
+          .map((line) =>
+            line.trim(),
+          )
+          .filter(Boolean);
+
+      const calicoHealthy =
+        calico.code === 0 &&
+        calicoLines.length > 0 &&
+        calicoLines.every(
+          (line) =>
+            /\bRunning\b/.test(line) &&
+            !/\b0\/\d+\b/.test(line),
+        );
+
+      return [
+        {
+          check:
+            'Control plane reachable',
+          status:
+            nodes.code === 0
+              ? 'pass'
+              : 'fail',
+          detail:
+            nodes.code === 0
+              ? 'kubectl get nodes succeeded'
+              : (
+                  nodes.stderr ||
+                  nodes.stdout ||
+                  'kubectl get nodes failed'
+                ).slice(0, 300),
+        },
+
+        {
+          check:
+            'Node readiness',
+          status:
+            readyNodes === totalNodes
+              ? 'pass'
+              : 'fail',
+          detail:
+            `${readyNodes}/${totalNodes} Ready`,
+        },
+
+        {
+          check:
+            'Calico',
+          status:
+            calicoHealthy
+              ? 'pass'
+              : 'fail',
+          detail:
+            calicoHealthy
+              ? `${calicoLines.length} Calico pod(s) healthy`
+              : (
+                  calico.stderr ||
+                  calico.stdout ||
+                  'Calico pods are not healthy'
+                ).slice(0, 300),
+        },
+
+        {
+          check:
+            'CoreDNS',
+          status:
+            dnsHealthy
+              ? 'pass'
+              : 'fail',
+          detail:
+            dnsHealthy
+              ? 'CoreDNS pods are healthy'
+              : (
+                  coredns.stderr ||
+                  coredns.stdout ||
+                  'CoreDNS pods are not healthy'
+                ).slice(0, 300),
+        },
+
+        {
+          check:
+            'Pod health',
+          status:
+            unhealthyPods.length === 0
+              ? 'pass'
+              : 'fail',
+          detail:
+            unhealthyPods.length === 0
+              ? `${podLines.length} pod(s) Running/Completed`
+              : `${unhealthyPods.length} pod(s) not healthy`,
+        },
+
+        {
+          check:
+            'Service API access',
+          status:
+            svc.code === 0
+              ? 'pass'
+              : 'fail',
+          detail:
+            svc.code === 0
+              ? `${svc.stdout
+                  .split('\n')
+                  .filter(Boolean)
+                  .length} service(s) registered`
+              : (
+                  svc.stderr ||
+                  svc.stdout ||
+                  'kubectl get svc failed'
+                ).slice(0, 300),
+        },
+      ];
+    },
+  );
+}
+
+
+/**
+ * --------------------------------------------------
+ * Kubespray
+ * --------------------------------------------------
+ */
+function mapCniForKubespray(cni) {
+  if (cni === 'Calico') return 'calico';
+  if (cni === 'Cilium') return 'cilium';
+  if (cni === 'Flannel') return 'flannel';
+
+  // Kubespray dropped native Weave support.
+  return 'calico';
+}
+
+/**
+ * Generates minimal Ansible inventory.
+ */
+function writeKubesprayInventory(
+  project,
+  vms,
+  kubesprayPath,
+) {
+  const cp =
+    vms.filter(
+      (v) => v.role === 'Control Plane',
+    );
+
+  const workers =
+    vms.filter(
+      (v) => v.role === 'Worker',
+    );
+
+  const hostLine = (vm) =>
+    `${vm.name} ansible_host=${vm.ip} ip=${vm.ip}`;
+
+  const inventory = [
+    '[kube_control_plane]',
+    ...cp.map(hostLine),
+    '',
+    '[etcd]',
+    ...cp.map(
+      (vm) => vm.name,
+    ),
+    '',
+    '[kube_node]',
+    ...workers.map(hostLine),
+    '',
+    '[k8s_cluster:children]',
+    'kube_control_plane',
+    'kube_node',
+    '',
+  ].join('\n');
+
+  const inventoryDir =
+    path.join(
+      kubesprayPath,
+      'inventory',
+      'kubeforge',
+    );
+
+  fs.mkdirSync(
+    inventoryDir,
+    {
+      recursive: true,
+    },
+  );
+
+  const inventoryPath =
+    path.join(
+      inventoryDir,
+      'hosts.ini',
+    );
+
+  fs.writeFileSync(
+    inventoryPath,
+    inventory,
+  );
+
+  const groupVarsDir =
+    path.join(
+      inventoryDir,
+      'group_vars',
+      'k8s_cluster',
+    );
+
+  fs.mkdirSync(
+    groupVarsDir,
+    {
+      recursive: true,
+    },
+  );
+
+  const groupVars = [
+    `kube_network_plugin: ${mapCniForKubespray(
+      project.cni,
+    )}`,
+    `kube_pods_subnet: ${project.podCidr}`,
+    `kube_service_addresses: ${project.serviceCidr}`,
+    '',
+  ].join('\n');
+
+  fs.writeFileSync(
+    path.join(
+      groupVarsDir,
+      'k8s-cluster.yml',
+    ),
+    groupVars,
+  );
+
+  return inventoryPath;
+}
+
+async function provisionKubespray(
+  project,
+  vms,
+  onLog,
+  stepContext,
+) {
+  const kubesprayPath =
+    process.env.KUBESPRAY_PATH;
+
+  if (!kubesprayPath) {
+    throw new Error(
+      'KUBESPRAY_PATH is not set. Kubespray runs as a local Ansible playbook against your VMs — clone Kubespray, pip install its requirements, and set KUBESPRAY_PATH in backend/.env. See README.md.',
+    );
+  }
+
+  /*
+   * Step 1:
+   * Generate inventory + group_vars.
+   */
+  const inventoryPath =
+    writeKubesprayInventory(
+      project,
+      vms,
+      kubesprayPath,
+    );
+
+  const inventoryStep =
+    stepContext.next();
+
+  if (
+    inventoryStep.stepIndex >
+    stepContext.resumeFromStep
+  ) {
+    await persistExecutionState(
+      project,
+      {
+        status: 'running',
+        vm: 'localhost',
+        phase: 'kubespray',
+        stepIndex:
+          inventoryStep.stepIndex,
+        totalSteps:
+          stepContext.totalSteps,
+        currentStep:
+          'Generate Kubespray inventory + group_vars',
+        currentCommand:
+          inventoryPath,
+        lastCompletedStep:
+          stepContext.resumeFromStep,
+      },
+    );
+
+    onLog({
+      time: new Date().toISOString(),
+      host: 'localhost',
+      command:
+        'Generate Kubespray inventory + group_vars',
+      output: `[OK] Generated at ${inventoryPath}`,
+      status: 'completed',
+      stage: 'provisioning',
+      phase: 'kubespray',
+      stepIndex:
+        inventoryStep.stepIndex,
+      totalSteps:
+        stepContext.totalSteps,
+    });
+
+    await persistExecutionState(
+      project,
+      {
+        status: 'running',
+        vm: 'localhost',
+        phase: 'kubespray',
+        stepIndex:
+          inventoryStep.stepIndex,
+        totalSteps:
+          stepContext.totalSteps,
+        currentStep:
+          'Generate Kubespray inventory + group_vars',
+        currentCommand:
+          inventoryPath,
+        lastCompletedStep:
+          inventoryStep.stepIndex,
+      },
+    );
+  } else {
+    onLog({
+      time: new Date().toISOString(),
+      host: 'localhost',
+      command:
+        'Generate Kubespray inventory + group_vars',
+      output:
+        `[SKIP] Already completed (${inventoryStep.stepIndex}/${stepContext.totalSteps})`,
+      status: 'skipped',
+      stage: 'provisioning',
+      phase: 'kubespray',
+      stepIndex:
+        inventoryStep.stepIndex,
+      totalSteps:
+        stepContext.totalSteps,
+    });
+  }
+
+  /*
+   * Step 2:
+   * Run Ansible.
+   */
+  const ansibleStep =
+    stepContext.next();
+
+  if (
+    ansibleStep.stepIndex <=
+    stepContext.resumeFromStep
+  ) {
+    onLog({
+      time: new Date().toISOString(),
+      host: 'cluster',
+      command:
+        'ansible-playbook -i <inventory> -b -v cluster.yml',
+      output:
+        `[SKIP] Already completed (${ansibleStep.stepIndex}/${stepContext.totalSteps})`,
+      status: 'skipped',
+      stage: 'provisioning',
+      phase: 'kubespray',
+      stepIndex:
+        ansibleStep.stepIndex,
+      totalSteps:
+        stepContext.totalSteps,
+    });
+
+    return;
+  }
+
+  await persistExecutionState(
+    project,
+    {
+      status: 'running',
+      vm: 'cluster',
+      phase: 'kubespray',
+      stepIndex:
+        ansibleStep.stepIndex,
+      totalSteps:
+        stepContext.totalSteps,
+      currentStep:
+        'Run Kubespray ansible-playbook',
+      currentCommand:
+        'ansible-playbook -i <inventory> -b -v cluster.yml',
+      lastCompletedStep:
+        ansibleStep.stepIndex - 1,
+    },
+  );
+
+  onLog({
+    time: new Date().toISOString(),
+    host: 'cluster',
+    command:
+      'ansible-playbook -i <inventory> -b -v cluster.yml',
+    output:
+      `[RUNNING] Step ${ansibleStep.stepIndex}/${stepContext.totalSteps} is currently executing...`,
+    status: 'running',
+    stage: 'provisioning',
+    phase: 'kubespray',
+    stepIndex:
+      ansibleStep.stepIndex,
+    totalSteps:
+      stepContext.totalSteps,
+  });
+
+  try {
+    const { stdout } =
+      await execFileAsync(
+        'ansible-playbook',
+        [
+          '-i',
+          inventoryPath,
+          '-b',
+          '-v',
+          'cluster.yml',
+        ],
+        {
+          cwd:
+            kubesprayPath,
+          maxBuffer:
+            1024 * 1024 * 20,
+        },
+      );
+
+    onLog({
+      time: new Date().toISOString(),
+      host: 'cluster',
+      command:
+        'ansible-playbook -i <inventory> -b -v cluster.yml',
+      output:
+        stdout.slice(-4000),
+      status: 'completed',
+      stage: 'provisioning',
+      phase: 'kubespray',
+      stepIndex:
+        ansibleStep.stepIndex,
+      totalSteps:
+        stepContext.totalSteps,
+    });
+
+    await persistExecutionState(
+      project,
+      {
+        status: 'running',
+        vm: 'cluster',
+        phase: 'kubespray',
+        stepIndex:
+          ansibleStep.stepIndex,
+        totalSteps:
+          stepContext.totalSteps,
+        currentStep:
+          'Run Kubespray ansible-playbook',
+        currentCommand:
+          'ansible-playbook -i <inventory> -b -v cluster.yml',
+        lastCompletedStep:
+          ansibleStep.stepIndex,
+        error: {
+          code: null,
+          message: null,
+        },
+      },
+    );
+  } catch (err) {
+    onLog({
+      time: new Date().toISOString(),
+      host: 'cluster',
+      command:
+        'ansible-playbook -i <inventory> -b -v cluster.yml',
+      output:
+        `[ERROR] ${err.message}`,
+      status: 'failed',
+      stage: 'provisioning',
+      phase: 'kubespray',
+      stepIndex:
+        ansibleStep.stepIndex,
+      totalSteps:
+        stepContext.totalSteps,
+    });
+
+    await persistExecutionState(
+      project,
+      {
+        status: 'failed',
+        vm: 'cluster',
+        phase: 'kubespray',
+        stepIndex:
+          ansibleStep.stepIndex,
+        totalSteps:
+          stepContext.totalSteps,
+        currentStep:
+          'Run Kubespray ansible-playbook',
+        currentCommand:
+          'ansible-playbook -i <inventory> -b -v cluster.yml',
+        lastCompletedStep:
+          ansibleStep.stepIndex - 1,
+        error: {
+          code: 'ANSIBLE_PLAYBOOK_FAILED',
+          message:
+            err.stderr ||
+            err.message,
+        },
+      },
+    );
+
+    throw new ProvisionError(
+      {
+        name: 'kubespray-runner',
+      },
+      'ansible-playbook cluster.yml',
+      {
+        stdout:
+          err.stdout || '',
+        stderr:
+          err.stderr ||
+          err.message,
+        code: 1,
+      },
+      project.executionState,
+    );
+  }
+}
+
+/**
+ * --------------------------------------------------
+ * STEP CONTEXT
+ * --------------------------------------------------
+ */
+function createStepContext(
+  project,
+  vms,
+  resumeFromStep = 0,
+) {
+  let currentStep = 0;
+
+  /*
+   * Some helper functions execute a command internally
+   * through runOn() and therefore consume a step.
+   *
+   * This helper keeps the explicit command counter aligned.
+   */
+  return {
+    totalSteps:
+      getProvisionTotalSteps(
+        project,
+        vms,
+      ),
+
+    resumeFromStep,
+
+    next() {
+      currentStep += 1;
+
+      return {
+        stepIndex: currentStep,
+        totalSteps:
+          getProvisionTotalSteps(
+            project,
+            vms,
+          ),
+      };
+    },
+
+    consumeExternalStep() {
+      currentStep += 1;
+    },
+
+    getCurrentStep() {
+      return currentStep;
+    },
+  };
+}
+
+/**
+ * --------------------------------------------------
+ * ENTRY POINT
+ * --------------------------------------------------
+ */
+async function provisionCluster(
+  project,
+  {
+    onLog = () => {},
+    vms = project.vms,
+    resumeFromStep = null,
+  } = {},
+) {
+  /*
+   * If caller explicitly supplies resumeFromStep, use it.
+   *
+   * Otherwise recover the last checkpoint from MongoDB/project.
+   */
+  const savedLastCompleted =
+    Number(
+      project.executionState?.lastCompletedStep ||
+        0,
+    );
+
+  const resolvedResumeFrom =
+    typeof resumeFromStep === 'number'
+      ? resumeFromStep
+      : savedLastCompleted;
+
+  const totalSteps =
+    getProvisionTotalSteps(
+      project,
+      vms,
+    );
+
+  const stepContext =
+    createStepContext(
+      project,
+      vms,
+      resolvedResumeFrom,
+    );
+
+  const runOn =
+    runOnFactory(onLog, {
+      project,
+      resumeFromStep:
+        resolvedResumeFrom,
+      totalSteps,
+    });
+
+  /*
+   * First line of every provisioning run.
+   */
+  onLog({
+    time: new Date().toISOString(),
+    host: 'cluster',
+    command: '[PROVISION]',
+    output:
+      `Using provisioning method: ${project.provisioningMethod} ` +
+      `(as configured on this project) with CNI: ${project.cni}`,
+    status: 'running',
+    stage: 'provisioning',
+    phase: 'provisioning',
+    stepIndex:
+      resolvedResumeFrom,
+    totalSteps,
+  });
+
+  /*
+   * Persist the starting/resume state.
+   */
+  await persistExecutionState(
+    project,
+    {
+      status: 'running',
+      vm:
+        project.executionState?.vm ||
+        null,
+      phase:
+        project.executionState?.phase ||
+        'provisioning',
+      stepIndex:
+        resolvedResumeFrom,
+      totalSteps,
+      currentStep:
+        project.executionState?.currentStep ||
+        null,
+      currentCommand:
+        project.executionState?.currentCommand ||
+        null,
+      lastCompletedStep:
+        resolvedResumeFrom,
+      error: {
+        code: null,
+        message: null,
+      },
+      startedAt:
+        project.executionState?.startedAt ||
+        new Date(),
+    },
+  );
+
+  /*
+   * --------------------------------------------------
+   * COMMON PREPARATION
+   * --------------------------------------------------
+   */
+  if (
+    project.provisioningMethod !==
+    'Kubespray'
+  ) {
+    for (const vm of vms) {
+      for (
+        const step of COMMON_PREP
+      ) {
+        const stepInfo =
+          stepContext.next();
+
+        await runOn(
+          vm,
+          step.command,
+          {
+            description:
+              step.description,
+            phase:
+              'common-prep',
+            ...stepInfo,
+          },
+        );
+      }
+    }
+  }
+
+  /*
+   * --------------------------------------------------
+   * METHOD-SPECIFIC PROVISIONING
+   * --------------------------------------------------
+   */
+  if (
+    project.provisioningMethod ===
+    'RKE2'
+  ) {
+    await provisionRKE2(
+      project,
+      vms,
+      runOn,
+      stepContext,
+    );
+  } else if (
+    project.provisioningMethod ===
+    'kubeadm'
+  ) {
+    await provisionKubeadm(
+      project,
+      vms,
+      runOn,
+      stepContext,
+    );
+  } else if (
+    project.provisioningMethod ===
+    'Kubespray'
+  ) {
+    await provisionKubespray(
+      project,
+      vms,
+      onLog,
+      stepContext,
+    );
+  } else {
+    throw new Error(
+      `Unknown provisioning method "${project.provisioningMethod}" — expected RKE2, kubeadm, or Kubespray`,
+    );
+  }
+
+  /*
+   * --------------------------------------------------
+   * PROVISIONING COMPLETE
+   * --------------------------------------------------
+   */
+  await persistExecutionState(
+    project,
+    {
+      status: 'completed',
+      vm: null,
+      phase: 'completed',
+      stepIndex: totalSteps,
+      totalSteps,
+      currentStep:
+        'Kubernetes cluster provisioning completed successfully',
+      currentCommand: null,
+      lastCompletedStep:
+        totalSteps,
+      error: {
+        code: null,
+        message: null,
+      },
+    },
+  );
+
+  onLog({
+    time: new Date().toISOString(),
+    host: 'cluster',
+    command: '[PROVISION]',
+    output:
+      'Kubernetes cluster provisioning completed successfully',
+    status: 'completed',
+    stage: 'provisioning',
+    phase: 'completed',
+    stepIndex: totalSteps,
+    totalSteps,
+  });
+}
+
+/**
+ * --------------------------------------------------
+ * UNINSTALL
+ * --------------------------------------------------
+ *
+ * Existing rollback behavior preserved.
+ */
+async function uninstallCluster(
+  project,
+  {
+    onLog = () => {},
+    vms = project.vms,
+  } = {},
+) {
+  const runOn =
+    runOnFactory(onLog);
+
+  const cp =
+    vms.filter(
+      (v) => v.role === 'Control Plane',
+    );
+
+  const workers =
+    vms.filter(
+      (v) => v.role === 'Worker',
+    );
+
+  if (
+    project.provisioningMethod ===
+    'RKE2'
+  ) {
+    for (
+      const vm of [
+        ...workers,
+        ...cp,
+      ]
+    ) {
+      const script =
+        vm.role === 'Worker'
+          ? '/usr/local/bin/rke2-agent-uninstall.sh'
+          : '/usr/local/bin/rke2-uninstall.sh';
+
+      await runOn(
+        vm,
+        `test -f ${script} && ${script} || echo "already removed"`,
+        {
+          description:
+            'Run RKE2 uninstall script',
+          phase: 'rollback',
+        },
+      );
+    }
+  } else if (
+    project.provisioningMethod ===
+    'kubeadm'
+  ) {
+    for (
+      const vm of [
+        ...workers,
+        ...cp,
+      ]
+    ) {
+      await runOn(
+        vm,
+        'kubeadm reset -f && rm -rf /etc/cni/net.d ~/.kube',
+        {
+          description:
+            'kubeadm reset',
+          phase: 'rollback',
+        },
+      );
+    }
+  } else {
+    const kubesprayPath =
+      process.env.KUBESPRAY_PATH;
+
+    if (!kubesprayPath) {
+      throw new Error(
+        'KUBESPRAY_PATH is not set — cannot run the reset playbook',
+      );
+    }
+
+    const inventoryPath =
+      writeKubesprayInventory(
+        project,
+        vms,
+        kubesprayPath,
+      );
+
+    await execFileAsync(
+      'ansible-playbook',
+      [
+        '-i',
+        inventoryPath,
+        '-b',
+        'reset.yml',
+        '-e',
+        'reset_confirmation=yes',
+      ],
+      {
+        cwd:
+          kubesprayPath,
+        maxBuffer:
+          1024 * 1024 * 20,
+      },
+    );
+
+    onLog({
+      time: new Date().toISOString(),
+      host: 'cluster',
+      command:
+        'ansible-playbook reset.yml',
+      output: '[OK]',
+      status: 'completed',
+      stage: 'rollback',
+    });
+  }
+}
+
+/**
+ * --------------------------------------------------
+ * CLEANUP BEFORE RETRY
+ * --------------------------------------------------
+ *
+ * IMPORTANT:
+ *
+ * This is now ONLY for a full reset.
+ *
+ * Normal repair/resume must NOT call this.
+ */
+async function cleanupBeforeRetry(
+  project,
+  onLog,
+  vms = project.vms,
+  {
+    fullReset = false,
+  } = {},
+) {
+  if (!fullReset) {
+    onLog({
+      time: new Date().toISOString(),
+      host: 'cluster',
+      command:
+        '[RETRY] Resume existing provisioning checkpoint',
+      output:
+        '[SKIP] Full cleanup disabled — provisioning will resume from the saved step.',
+      status: 'skipped',
+      stage: 'provisioning',
+      phase: 'resume',
+    });
+
+    return;
+  }
+
+  if (
+    project.provisioningMethod !==
+    'kubeadm'
+  ) {
+    return;
+  }
+
+  const runOn =
+    runOnFactory(() => {});
+
+  const controlPlanes =
+    vms.filter(
+      (v) =>
+        v.role ===
+        'Control Plane',
+    );
+
+  for (
+    const vm of controlPlanes
+  ) {
+    try {
+      await runOn(
+        vm,
+        'kubeadm reset -f || true',
+        {
+          description:
+            'Reset partial kubeadm state before full retry',
+          phase:
+            'full-reset',
+        },
+      );
+    } catch (err) {
+      onLog({
+        time:
+          new Date().toISOString(),
+        host: vm.name,
+        command:
+          'kubeadm reset -f',
+        output:
+          `[WARN] cleanup itself failed: ${err.message}`,
+        stage: 'provisioning',
+        phase:
+          'full-reset',
+      });
+    }
+  }
+}
+
+module.exports = {
+  provisionCluster,
+  uninstallCluster,
+  cleanupBeforeRetry,
+  ProvisionError,
+  COMMON_PREP,
+  deriveClusterDNS,
+  mapCniForRke2,
+  mapCniForKubespray,
+  getProvisionTotalSteps,
+};
