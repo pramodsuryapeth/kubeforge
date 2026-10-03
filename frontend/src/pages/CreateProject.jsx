@@ -10,16 +10,19 @@ import {
 import { api } from '../api/client.js';
 import VMTable from '../components/VMTable.jsx';
 
-const PROVISIONING_METHODS = ['kubeadm', 'RKE2', 'Kubespray'];
+const PROVISIONING_METHODS = ['RKE2', 'kubeadm', 'Kubespray'];
+
 const CNI_OPTIONS = ['Calico', 'Cilium', 'Flannel', 'Weave'];
+
 const AI_MODELS = ['KubeForge AI (v1)'];
+
 const ENVIRONMENTS = ['On-Premise', 'AWS', 'Azure', 'GCP', 'VMware'];
 
 const initialForm = {
   name: '',
   description: '',
   kubernetesVersion: 'v1.30.1',
-  provisioningMethod: 'Kubeadm',
+  provisioningMethod: 'RKE2',
   cni: 'Calico',
   podCidr: '10.244.0.0/16',
   serviceCidr: '10.96.0.0/12',

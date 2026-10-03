@@ -225,38 +225,82 @@ const K8S_REPO_COMMAND = [
 ].join('\n');
 
 const K8S_PACKAGE_INSTALL_COMMAND = [
+
   'set -e',
+
   'wait_for_apt() {',
   '  while fuser /var/lib/apt/lists/lock /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend >/dev/null 2>&1 ; do',
   '    echo "[WAIT] Another APT/DPKG process is running...";',
   '    sleep 3;',
   '  done',
   '}',
+
   'PKGS="containerd kubelet kubeadm kubectl"',
   'MISSING=""',
-  'for p in $PKGS ; do',
-  '  if dpkg -s "$p" >/dev/null 2>&1 ; then',
-  '    V="$(dpkg-query -W -f=\'${Version}\' "$p" 2>/dev/null || echo unknown)"',
-  '    echo "[INFO] $p already installed (version=$V)"',
+
+  'check_package() {',
+  '  PKG="$1"',
+  '  BIN="$2"',
+
+  '  if dpkg-query -W -f=\'${Status}\' "$PKG" 2>/dev/null | grep -q "install ok installed" &&',
+  '     command -v "$BIN" >/dev/null 2>&1 &&',
+  '     [ -x "$(command -v "$BIN")" ]; then',
+
+  '    V="$(dpkg-query -W -f=\'${Version}\' "$PKG" 2>/dev/null || echo unknown)"',
+  '    echo "[INFO] $PKG installed and binary valid (version=$V, binary=$(command -v "$BIN"))"',
+
   '  else',
-  '    echo "[CHECK] $p NOT installed"',
-  '    MISSING="$MISSING $p"',
+
+  '    echo "[CHECK] $PKG missing or binary invalid"',
+  '    MISSING="$MISSING $PKG"',
+
   '  fi',
-  'done',
+  '}',
+
+  'check_package containerd containerd',
+  'check_package kubelet kubelet',
+  'check_package kubeadm kubeadm',
+  'check_package kubectl kubectl',
+
   'if [ -n "$MISSING" ] ; then',
-  '  echo "[INSTALL] installing missing packages:$MISSING"',
+
+  '  echo "[INSTALL] installing/reinstalling packages:$MISSING"',
   '  wait_for_apt',
-  '  DEBIAN_FRONTEND=noninteractive apt-get install -y $MISSING',
+
+  '  DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y $MISSING',
+
   'else',
-  '  echo "[SKIP] all kubeadm packages already installed"',
+
+  '  echo "[SKIP] all kubeadm packages installed and binaries valid"',
+
   'fi',
+
+  'echo "[VERIFY] validating required binaries after installation"',
+
+  'for BIN in containerd kubelet kubeadm kubectl ; do',
+  '  if ! command -v "$BIN" >/dev/null 2>&1 ; then',
+  '    echo "[ERROR] required binary missing after package installation: $BIN"',
+  '    exit 1',
+  '  fi',
+
+  '  if [ ! -x "$(command -v "$BIN")" ]; then',
+  '    echo "[ERROR] required binary is not executable: $BIN"',
+  '    exit 1',
+  '  fi',
+
+  '  echo "[OK] $BIN -> $(command -v "$BIN")"',
+  'done',
+
   'echo "[CHECK] applying apt-mark hold"',
   'apt-mark hold containerd kubelet kubeadm kubectl >/dev/null',
+
   'echo "[INFO] final versions:"',
+
   'for p in $PKGS ; do',
   '  V="$(dpkg-query -W -f=\'${Version}\' "$p" 2>/dev/null || echo not-installed)"',
   '  echo "  $p = $V"',
   'done',
+
 ].join('\n');
 
 const CONTAINERD_CONFIG_COMMAND = [
